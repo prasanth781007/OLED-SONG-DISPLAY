@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP32 OLED Animation Uploader</title>
+<style>
+  :root{--bg:#0f1220;--card:#181c30;--line:#2a3050;--txt:#e8eaf6;--mut:#8b93b8;--acc:#4f8cff;--ok:#2ecc71;--bad:#ff5c7a}
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--txt);font:15px/1.5 system-ui,Segoe UI,Roboto,sans-serif;padding:20px}
+  .wrap{max-width:820px;margin:auto} h1{font-size:22px;margin:0 0 4px} .sub{color:var(--mut);margin-bottom:18px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:16px}
+  h2{font-size:16px;margin:0 0 12px;color:var(--acc)}
+  input[type=text],input[type=email],input[type=password]{width:100%;padding:10px;margin:4px 0 10px;border-radius:8px;border:1px solid var(--line);background:#0f1220;color:var(--txt)}
+  input[type=file]{margin:6px 0 12px;color:var(--mut)}
+  button{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:9px 16px;cursor:pointer;font-weight:600}
+  button:disabled{opacity:.45;cursor:not-allowed} button.sec{background:#2a3050} button.bad{background:var(--bad)} button.ok{background:var(--ok);color:#06210f}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  canvas{width:256px;height:128px;image-rendering:pixelated;background:#000;border:2px solid var(--line);border-radius:6px}
+  .bar{height:8px;background:#0f1220;border-radius:6px;overflow:hidden;margin-top:10px}.bar>div{height:100%;width:0;background:var(--acc);transition:width .2s}
+  #msg{margin-top:8px;min-height:20px} .err{color:var(--bad)} .good{color:var(--ok)}
+  table{width:100%;border-collapse:collapse} td,th{padding:8px;border-bottom:1px solid var(--line);text-align:left;font-size:14px} th{color:var(--mut)}
+  .tag{background:var(--ok);color:#06210f;border-radius:6px;padding:1px 8px;font-size:12px;font-weight:700}
+  .hidden{display:none} .mut{color:var(--mut)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>ESP32 OLED Animation Uploader</h1>
+  <div class="sub">Upload an animation <code>.h</code> file &rarr; stored in Firebase Firestore &rarr; your ESP32 downloads &amp; plays it.</div>
+
+  <!-- LOGIN -->
+  <div class="card" id="loginCard">
+    <h2>Login</h2>
+    <input id="email" type="email" placeholder="Email" autocomplete="username">
+    <input id="pass" type="password" placeholder="Password" autocomplete="current-password">
+    <button id="loginBtn">Login</button>
+    <div id="loginMsg" class="err"></div>
+  </div>
+
+  <div id="app" class="hidden">
+    <div class="row" style="justify-content:space-between;margin-bottom:12px">
+      <div class="mut">Signed in as <b id="who"></b></div><button class="sec" id="logoutBtn">Logout</button>
+    </div>
+
+    <!-- UPLOAD -->
+    <div class="card">
+      <h2>1. Upload animation (.h file)</h2>
+      <input id="file" type="file" accept=".h,.txt">
+      <input id="name" type="text" placeholder="Animation name (e.g. Radhima)">
+      <div class="row">
+        <canvas id="preview" width="128" height="64"></canvas>
+        <div id="info" class="mut">No file selected.</div>
+      </div>
+      <div style="margin-top:12px"><button id="uploadBtn" disabled>Upload to Firebase</button></div>
+      <div class="bar"><div id="prog"></div></div>
+      <div id="msg"></div>
+    </div>
+
+    <!-- LIST -->
+    <div class="card">
+      <h2>2. Your animations</h2>
+      <div class="mut" style="margin-bottom:8px">Active on ESP32: <b id="active">none</b></div>
+      <table><thead><tr><th>Name</th><th>Frames</th><th>Size</th><th></th></tr></thead><tbody id="list"></tbody></table>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+import { getFirestore, doc, setDoc, getDocs, collection, writeBatch, onSnapshot, deleteDoc, getDoc } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyArvnz-mlIzSivbAsKetuPI5Y0NByh5-EA",
+  authDomain: "euhjasg.firebaseapp.com",
+  projectId: "euhjasg",
+  storageBucket: "euhjasg.firebasestorage.app",
+  messagingSenderId: "34837891041",
+  appId: "1:34837891041:web:f4603caa641cb08da3f4a0"
+};
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+
+const FRAMES_PER_CHUNK = 16;           // 16 frames x 1024 B = 16 KB raw (~22 KB base64) per Firestore doc
+const $ = id => document.getElementById(id);
+let parsed = null, previewTimer = null, activeId = null;
+
+/* ---------- parse the animation .h file ---------- */
+function parseAnimationHeader(text){
+  const num=(re)=>{const m=text.match(re);return m?parseInt(m[1],10):NaN;};
+  const width=num(/#define\s+\w*WIDTH\s+(\d+)/), height=num(/#define\s+\w*HEIGHT\s+(\d+)/), frameCount=num(/#define\s+\w*FRAME_COUNT\s+(\d+)/);
+  if(!width||!height||!frameCount) throw new Error("Could not find WIDTH / HEIGHT / FRAME_COUNT defines");
+  const fi=text.search(/_frames\s*\[[^\]]*\]\s*\[[^\]]*\]/);
+  if(fi<0) throw new Error("Could not find the *_frames array");
+  const dm=text.match(/_delays\s*\[[^\]]*\]\s*(?:PROGMEM)?\s*=\s*\{([^}]*)\}/);
+  let delays=dm?dm[1].split(",").map(s=>s.trim()).filter(Boolean).map(Number):[];
+  while(delays.length<frameCount) delays.push(100);
+  delays=delays.slice(0,frameCount);
+  let end=text.indexOf("const AnimatedGIF",fi); if(end<0) end=text.length;
+  const hex=text.slice(fi,end).match(/0x[0-9a-fA-F]{1,2}/g)||[];
+  const frameBytes=Math.ceil(width/8)*height;
+  if(hex.length!==frameBytes*frameCount) throw new Error(`Expected ${frameBytes*frameCount} bytes, found ${hex.length}`);
+  const data=new Uint8Array(hex.length); for(let i=0;i<hex.length;i++) data[i]=parseInt(hex[i],16);
+  return {width,height,frameCount,delays,frameBytes,data};
+}
+
+/* ---------- preview ---------- */
+function startPreview(a){
+  clearTimeout(previewTimer);
+  const cv=$("preview"); cv.width=a.width; cv.height=a.height;
+  const ctx=cv.getContext("2d"), img=ctx.createImageData(a.width,a.height), rowB=Math.ceil(a.width/8);
+  let f=0;
+  (function tick(){
+    const base=f*a.frameBytes;
+    for(let y=0;y<a.height;y++)for(let x=0;x<a.width;x++){
+      const on=(a.data[base+y*rowB+(x>>3)]>>(7-(x&7)))&1, p=(y*a.width+x)*4, v=on?255:0;
+      img.data[p]=img.data[p+1]=img.data[p+2]=v; img.data[p+3]=255;
+    }
+    ctx.putImageData(img,0,0);
+    previewTimer=setTimeout(tick,Math.max(20,a.delays[f])); f=(f+1)%a.frameCount;
+  })();
+}
+
+function toBase64(u8){
+  let s=""; for(let i=0;i<u8.length;i+=8192) s+=String.fromCharCode.apply(null,u8.subarray(i,i+8192));
+  return btoa(s);
+}
+const slug = s => s.toLowerCase().replace(/[^a-z0-9]+/g,"_").replace(/^_|_$/g,"") || "animation";
+const say = (t,cls="") => { $("msg").className=cls; $("msg").textContent=t; };
+
+/* ---------- file select ---------- */
+$("file").addEventListener("change", async e=>{
+  const file=e.target.files[0]; parsed=null; $("uploadBtn").disabled=true; if(!file) return;
+  try{
+    parsed=parseAnimationHeader(await file.text());
+    $("name").value=$("name").value||file.name.replace(/\.[^.]+$/,"");
+    $("info").textContent=`${parsed.width}x${parsed.height}, ${parsed.frameCount} frames, ${(parsed.data.length/1024).toFixed(0)} KB`;
+    startPreview(parsed); $("uploadBtn").disabled=false; say("");
+  }catch(err){ $("info").textContent=""; say(err.message,"err"); }
+});
+
+/* ---------- upload ---------- */
+$("uploadBtn").addEventListener("click", async ()=>{
+  if(!parsed) return;
+  const name=$("name").value.trim()||"animation", id=slug(name), version=String(Date.now());
+  $("uploadBtn").disabled=true; $("prog").style.width="5%"; say("Uploading...");
+  try{
+    const nChunks=Math.ceil(parsed.frameCount/FRAMES_PER_CHUNK), step=FRAMES_PER_CHUNK*parsed.frameBytes;
+    for(let c=0;c<nChunks;c++){                       // one small write per chunk
+      const part=parsed.data.subarray(c*step,Math.min((c+1)*step,parsed.data.length));
+      await setDoc(doc(db,"animations",id,"chunks","c"+c),{index:c,data:toBase64(part)});
+      $("prog").style.width=(5+90*(c+1)/nChunks)+"%";
+    }
+    await setDoc(doc(db,"animations",id),{                // metadata written LAST = upload complete
+      name,width:parsed.width,height:parsed.height,frameCount:parsed.frameCount,
+      framesPerChunk:FRAMES_PER_CHUNK,chunkCount:nChunks,
+      delays:parsed.delays.join(","),version,owner:auth.currentUser.uid
+    });
+    if(activeId===id) await setDoc(doc(db,"config","active"),{animationId:id,version}); // re-upload of the playing one
+    $("prog").style.width="100%"; say(`Uploaded "${name}". Press "Play on ESP32" below.`,"good");
+    loadList();
+  }catch(err){ say("Upload failed: "+err.message,"err"); }
+  $("uploadBtn").disabled=false;
+});
+
+/* ---------- list / play / delete ---------- */
+async function loadList(){
+  const snap=await getDocs(collection(db,"animations")), tb=$("list"); tb.innerHTML="";
+  if(snap.empty){ tb.innerHTML='<tr><td colspan="4" class="mut">Nothing uploaded yet.</td></tr>'; return; }
+  snap.forEach(d=>{
+    const a=d.data(), tr=document.createElement("tr");
+    tr.innerHTML=`<td>${a.name.replace(/</g,"&lt;")} ${d.id===activeId?'<span class="tag">PLAYING</span>':""}</td><td>${a.frameCount}</td><td>${(a.frameCount*Math.ceil(a.width/8)*a.height/1024).toFixed(0)} KB</td><td class="row"></td>`;
+    const play=document.createElement("button"); play.textContent="Play on ESP32"; play.className="ok";
+    play.onclick=async()=>{ await setDoc(doc(db,"config","active"),{animationId:d.id,version:a.version}); };
+    const del=document.createElement("button"); del.textContent="Delete"; del.className="bad";
+    del.onclick=async()=>{
+      if(!confirm("Delete "+a.name+"?")) return;
+      const ch=await getDocs(collection(db,"animations",d.id,"chunks")), b=writeBatch(db);
+      ch.forEach(c=>b.delete(c.ref)); await b.commit(); await deleteDoc(doc(db,"animations",d.id)); loadList();
+    };
+    tr.lastElementChild.append(play,del); tb.appendChild(tr);
+  });
+}
+
+/* ---------- auth ---------- */
+$("loginBtn").addEventListener("click", async ()=>{
+  $("loginMsg").textContent="";
+  try{ await signInWithEmailAndPassword(auth,$("email").value.trim(),$("pass").value); }
+  catch(e){ $("loginMsg").textContent=e.code||e.message; }
+});
+$("logoutBtn").addEventListener("click",()=>signOut(auth));
+
+let unsubActive=null;
+onAuthStateChanged(auth,user=>{
+  $("loginCard").classList.toggle("hidden",!!user); $("app").classList.toggle("hidden",!user);
+  if(user){
+    $("who").textContent=user.email;
+    unsubActive=onSnapshot(doc(db,"config","active"),s=>{
+      activeId=s.exists()?s.data().animationId:null; $("active").textContent=activeId||"none"; loadList();
+    },err=>say(err.message,"err"));
+  } else if(unsubActive){ unsubActive(); unsubActive=null; }
+});
+</script>
+</body>
+</html>
